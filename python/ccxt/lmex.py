@@ -1,7 +1,7 @@
 from ccxt.base.exchange import Exchange
 import hashlib
 import hmac
-from ccxt.base.errors import ExchangeError, AuthenticationError, ArgumentsRequired, BadRequest
+from ccxt.base.errors import ExchangeError, AuthenticationError, ArgumentsRequired, BadRequest, BadSymbol, PermissionDenied, RateLimitExceeded, InsufficientFunds, NotSupported
 
 class lmex(Exchange):
 
@@ -14,8 +14,8 @@ class lmex(Exchange):
             'rateLimit': 100,
             'has': {
                 'CORS': False,
-                'spot': False,
-                'margin': False,
+                'spot': True,
+                'margin': True,
                 'swap': True,
                 'future': True,
                 'option': False,
@@ -31,6 +31,7 @@ class lmex(Exchange):
                 'fetchOrderBook': True,
                 'fetchPositions': True,
                 'fetchTicker': True,
+                'fetchTickers': True,
                 'fetchTrades': True,
                 'fetchLeverage': True,
                 'fetchLeverageTiers': True,
@@ -82,16 +83,16 @@ class lmex(Exchange):
                 },
             },
             'timeframes': {
-                '1': '1min',
-                '5': '5m',
-                '15': '15m',
-                '30': '30m',
-                '60': '1h',
-                '240': '4h',
-                '360': '6h',
-                '1440': '1d',
-                '10080': '1w',
-                '43200': '1M',
+                '1m': '1',
+                '5m': '5',
+                '15m': '15',
+                '30m': '30',
+                '1h': '60',
+                '4h': '240',
+                '6h': '360',
+                '1d': '1440',
+                '1w': '10080',
+                '1M': '43200',
             },
             'exceptions': {
                 '-8104': ExchangeError,  # ORDER_BELONGS_TO_VENDOR
@@ -108,19 +109,13 @@ class lmex(Exchange):
         })
 
     def fetch_markets(self, params={}):
-        """
-        Fetch the list of markets available on the exchange
-        :param params:
-        :return:
-        """
-        response = self.publicGetApiV21MarketSummary(params)
+        response = self.request('api/v2.1/market_summary', 'public', 'GET', params)
         result = []
         for market in response:
             id = self.safe_string(market, 'symbol')
-            baseId, quoteId = id.split('-')
-            base = self.safe_currency_code(baseId)
-            quote = self.safe_currency_code(quoteId)
-            symbol = base + '/' + quote
+            base = self.safe_string(market, 'base')
+            quote = self.safe_string(market, 'quote')
+            symbol = f"{base}/{quote}" if base and quote else id
             active = self.safe_value(market, 'active', False)
             precision = {
                 'amount': self.safe_number(market, 'minOrderSize'),
@@ -136,14 +131,31 @@ class lmex(Exchange):
                     'max': None,
                 },
             }
+            contractSize = self.safe_number(market, 'contractSize')
             result.append({
                 'id': id,
                 'symbol': symbol,
                 'base': base,
                 'quote': quote,
-                'baseId': baseId,
-                'quoteId': quoteId,
+                'settle': quote,
+                'baseId': base,
+                'quoteId': quote,
+                'settleId': quote,
+                'type': 'swap',
+                'spot': False,
+                'margin': False,
+                'swap': True,
+                'future': False,
+                'option': False,
                 'active': active,
+                'contract': True,
+                'linear': True,
+                'inverse': False,
+                'contractSize': contractSize,
+                'expiry': None,
+                'expiryDatetime': None,
+                'strike': None,
+                'optionType': None,
                 'precision': precision,
                 'limits': limits,
                 'info': market,
@@ -163,16 +175,16 @@ class lmex(Exchange):
     def parse_ticker(self, ticker, market=None):
         symbol = self.safe_symbol(None, market)
         timestamp = self.milliseconds()
-        last = self.safe_number(ticker, 'lastPrice')
+        last = self.safe_number(ticker, 'last')
         return {
             'symbol': symbol,
             'timestamp': timestamp,
             'datetime': self.iso8601(timestamp),
-            'high': None,
-            'low': None,
-            'bid': None,
+            'high': self.safe_number(ticker, 'high24Hr'),
+            'low': self.safe_number(ticker, 'low24Hr'),
+            'bid': self.safe_number(ticker, 'highestBid'),
             'bidVolume': None,
-            'ask': None,
+            'ask': self.safe_number(ticker, 'lowestAsk'),
             'askVolume': None,
             'vwap': None,
             'open': None,
@@ -180,12 +192,31 @@ class lmex(Exchange):
             'last': last,
             'previousClose': None,
             'change': None,
-            'percentage': None,
+            'percentage': self.safe_number(ticker, 'percentageChange'),
             'average': None,
-            'baseVolume': None,
+            'baseVolume': self.safe_number(ticker, 'volume'),
             'quoteVolume': None,
             'info': ticker,
         }
+
+    def fetch_tickers(self, symbols=None, params={}):
+        self.load_markets()
+        response = self.request('api/v2.1/market_summary', 'public', 'GET', params)
+        result = {}
+        for ticker in response:
+            market = self.safe_market(ticker['symbol'])
+            parsed = self.parse_ticker(ticker, market)
+            symbol = parsed['symbol']
+            result[symbol] = parsed
+        return self.filter_by_array(result, 'symbol', symbols)
+
+    def parse_tickers(self, response, symbols=None):
+        result = {}
+        for ticker in response:
+            parsed = self.parse_ticker(ticker)
+            symbol = parsed['symbol']
+            result[symbol] = parsed
+        return self.filter_by_array(result, 'symbol', symbols)
 
     def fetch_order_book(self, symbol, limit=None, params={}):
         """
@@ -528,6 +559,21 @@ class lmex(Exchange):
             request['end'] = self.sum(since, limit * self.parse_timeframe(timeframe) * 1000)
         response = self.publicGetApiV21Ohlcv(self.extend(request, params))
         return self.parse_ohlcvs(response, market, timeframe, since, limit)
+
+    def parse_timeframe(self, timeframe):
+        timeframe_map = {
+            '1m': 60,
+            '5m': 300,
+            '15m': 900,
+            '30m': 1800,
+            '1h': 3600,
+            '4h': 14400,
+            '6h': 21600,
+            '1d': 86400,
+            '1w': 604800,
+            '1M': 2592000,
+        }
+        return timeframe_map[timeframe] if timeframe in timeframe_map else None
 
     def parse_ohlcv(self, ohlcv, market=None):
         return [

@@ -10,4 +10,4 @@ sys.path.append(root + '/python')
 
 import ccxt.async_support as ccxt  # noqa: E402
 
-pprint(asyncio.run(ccxt.binance().fetch_ticker('ETH/BTC')))
+pprint(asyncio.run(ccxt.lmex().fetch_ticker('ETH/BTC')))
