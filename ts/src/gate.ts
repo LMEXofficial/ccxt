@@ -5,7 +5,7 @@ import { Precise } from './base/Precise.js';
 import { TICK_SIZE } from './base/functions/number.js';
 import { ExchangeError, BadRequest, ArgumentsRequired, AuthenticationError, PermissionDenied, AccountSuspended, InsufficientFunds, RateLimitExceeded, ExchangeNotAvailable, BadSymbol, InvalidOrder, OrderNotFound, NotSupported, AccountNotEnabled, OrderImmediatelyFillable, BadResponse } from './base/errors.js';
 import { sha512 } from './static_dependencies/noble-hashes/sha512.js';
-import type { Int, OrderSide, OrderType, OHLCV, Trade, FundingRateHistory, OpenInterest, Order, Balances, OrderRequest, FundingHistory, Str, Transaction, Ticker, OrderBook, Tickers, Greeks, Strings, Market, Currency, MarketInterface, TransferEntry, Leverage, Leverages, Num, OptionChain, Option, MarginModification, TradingFeeInterface, Currencies, TradingFees, Position, Dict, LeverageTier, LeverageTiers, int, CancellationRequest } from './base/types.js';
+import type { Int, OrderSide, OrderType, OHLCV, Trade, FundingRateHistory, OpenInterest, Order, Balances, OrderRequest, FundingHistory, Str, Transaction, Ticker, OrderBook, Tickers, Greeks, Strings, Market, Currency, MarketInterface, TransferEntry, Leverage, Leverages, Num, OptionChain, Option, MarginModification, TradingFeeInterface, Currencies, TradingFees, Position, Dict, LeverageTier, LeverageTiers, int, CancellationRequest, LedgerEntry } from './base/types.js';
 
 /**
  * @class gate
@@ -593,6 +593,8 @@ export default class gate extends Exchange {
             },
             // copied from gatev2
             'commonCurrencies': {
+                'ORT': 'XREATORS',
+                'ASS': 'ASSF',
                 '88MPH': 'MPH',
                 'AXIS': 'AXISDEFI',
                 'BIFI': 'BITCOINFILE',
@@ -627,6 +629,8 @@ export default class gate extends Exchange {
                 },
                 'createMarketBuyOrderRequiresPrice': true,
                 'networks': {
+                    'LINEA': 'LINEAETH',
+                    'KON': 'KONET',
                     'AVAXC': 'AVAX_C',
                     'BEP20': 'BSC',
                     'EOS': 'EOS',
@@ -639,6 +643,9 @@ export default class gate extends Exchange {
                     'OPTIMISM': 'OPETH',
                     'POLKADOT': 'DOTSM',
                     'TRC20': 'TRX',
+                    'LUNA': 'LUNC',
+                    'BASE': 'BASEEVM',
+                    'BRC20': 'BTCBRC',
                 },
                 'timeInForce': {
                     'GTC': 'gtc',
@@ -6590,7 +6597,7 @@ export default class gate extends Exchange {
         return result;
     }
 
-    async fetchLedger (code: Str = undefined, since: Int = undefined, limit: Int = undefined, params = {}) {
+    async fetchLedger (code: Str = undefined, since: Int = undefined, limit: Int = undefined, params = {}): Promise<LedgerEntry[]> {
         /**
          * @method
          * @name gate#fetchLedger
@@ -6600,19 +6607,19 @@ export default class gate extends Exchange {
          * @see https://www.gate.io/docs/developers/apiv4/en/#query-account-book-2
          * @see https://www.gate.io/docs/developers/apiv4/en/#query-account-book-3
          * @see https://www.gate.io/docs/developers/apiv4/en/#list-account-changing-history
-         * @param {string} code unified currency code
+         * @param {string} [code] unified currency code
          * @param {int} [since] timestamp in ms of the earliest ledger entry
          * @param {int} [limit] max number of ledger entries to return
          * @param {object} [params] extra parameters specific to the exchange API endpoint
          * @param {int} [params.until] end time in ms
-         * @param {boolean} [params.paginate] default false, when true will automatically paginate by calling this endpoint multiple times. See in the docs all the [availble parameters](https://github.com/ccxt/ccxt/wiki/Manual#pagination-params)
+         * @param {boolean} [params.paginate] default false, when true will automatically paginate by calling this endpoint multiple times. See in the docs all the [available parameters](https://github.com/ccxt/ccxt/wiki/Manual#pagination-params)
          * @returns {object} a [ledger structure]{@link https://docs.ccxt.com/#/?id=ledger-structure}
          */
         await this.loadMarkets ();
         let paginate = false;
         [ paginate, params ] = this.handleOptionAndParams (params, 'fetchLedger', 'paginate');
         if (paginate) {
-            return await this.fetchPaginatedCallDynamic ('fetchLedger', code, since, limit, params);
+            return await this.fetchPaginatedCallDynamic ('fetchLedger', code, since, limit, params) as LedgerEntry[];
         }
         let type = undefined;
         let currency = undefined;
@@ -6704,7 +6711,7 @@ export default class gate extends Exchange {
         return this.parseLedger (response, currency, since, limit);
     }
 
-    parseLedgerEntry (item: Dict, currency: Currency = undefined) {
+    parseLedgerEntry (item: Dict, currency: Currency = undefined): LedgerEntry {
         //
         // spot
         //
@@ -6758,6 +6765,7 @@ export default class gate extends Exchange {
             direction = 'in';
         }
         const currencyId = this.safeString (item, 'currency');
+        currency = this.safeCurrency (currencyId, currency);
         const type = this.safeString (item, 'type');
         const rawTimestamp = this.safeString (item, 'time');
         let timestamp = undefined;
@@ -6769,7 +6777,8 @@ export default class gate extends Exchange {
         const balanceString = this.safeString (item, 'balance');
         const changeString = this.safeString (item, 'change');
         const before = this.parseNumber (Precise.stringSub (balanceString, changeString));
-        return {
+        return this.safeLedgerEntry ({
+            'info': item,
             'id': this.safeString (item, 'id'),
             'direction': direction,
             'account': undefined,
@@ -6784,8 +6793,7 @@ export default class gate extends Exchange {
             'after': this.safeNumber (item, 'balance'),
             'status': undefined,
             'fee': undefined,
-            'info': item,
-        };
+        }, currency) as LedgerEntry;
     }
 
     parseLedgerEntryType (type) {
