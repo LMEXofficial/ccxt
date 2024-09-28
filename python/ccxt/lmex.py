@@ -28,7 +28,7 @@ class lmex(Exchange):
                 'fetchClosedOrders': True,
                 'fetchMarkets': True,
                 'fetchMyTrades': True,
-                'fetchOHLCV': True,  # LMEX supports OHLCV data
+                'fetchOHLCV': True,
                 'fetchOpenOrders': True,
                 'fetchOrder': True,
                 'fetchOrderBook': True,
@@ -40,6 +40,8 @@ class lmex(Exchange):
                 'fetchLeverageTiers': True,
                 'fetchFundingRate': True,
                 'fetchFundingRateHistory': True,
+                'setPositionMode': True,
+                'fetchOpenInterest': True,
             },
             'urls': {
                 'logo': 'https://user-images.githubusercontent.com/1294454/YOUR_LOGO_URL_HERE',
@@ -66,6 +68,8 @@ class lmex(Exchange):
                         'api/v2.1/user/trade_history',
                         'api/v2.1/user/positions',
                         'api/v2.1/user/wallet',
+                        'api/v2.1/risk_limit',
+                        'api/v2.1/leverage',
                     ],
                     'post': [
                         'api/v2.1/order',
@@ -382,11 +386,21 @@ class lmex(Exchange):
             'symbol': market['id'],
         }
         response = self.publicGetApiV21FundingHistory(self.extend(request, params))
+        # {
+        #   "BTC-PERP": [
+        #     {
+        #       "time": 1706515200,
+        #       "rate": 0.000011405,
+        #       "symbol": "BTC-PERP"
+        #     }
+        #   ]
+        # }
         return self.parse_funding_rate(response, market)
 
     def parse_funding_rate(self, fundingRate, market=None):
         data = self.safe_value(fundingRate, market['id'], [])
         latest = self.safe_value(data, 0, {})
+        timestamp = self.safe_timestamp(latest, 'time')
         return {
             'info': fundingRate,
             'symbol': market['symbol'],
@@ -394,11 +408,11 @@ class lmex(Exchange):
             'indexPrice': None,
             'interestRate': None,
             'estimatedSettlePrice': None,
-            'timestamp': self.safe_timestamp(latest, 'time'),
-            'datetime': self.iso8601(self.safe_timestamp(latest, 'time')),
+            'timestamp': timestamp,
+            'datetime': self.iso8601(timestamp),
             'fundingRate': self.safe_number(latest, 'rate'),
-            'fundingTimestamp': None,
-            'fundingDatetime': None,
+            'fundingTimestamp': timestamp,
+            'fundingDatetime': self.iso8601(timestamp),
             'nextFundingRate': None,
             'nextFundingTimestamp': None,
             'nextFundingDatetime': None,
@@ -494,17 +508,24 @@ class lmex(Exchange):
         timestamp = self.safe_integer(order, 'timestamp')
         symbol = self.safe_symbol(self.safe_string(order, 'symbol'), market)
         type_raw = self.safe_integer(order, 'orderType')
-        type = 'limit' if type_raw == 76 else 'market' if type_raw == 77 else 'unknown'
+        type = 'limit' if type_raw == 76 else 'market' if type_raw == 77 else 'algo' if type_raw == 80 else 'unknown'
         side = self.safe_string_lower(order, 'side')
         price = self.safe_number(order, 'price')
         amount = self.safe_number(order, 'size')
-        filled = self.safe_number(order, 'fillSize')
+        filled = self.safe_number_2(order, 'fillSize', 'filledSize')  # Handle both fillSize and filledSize
         remaining = self.safe_number(order, 'remainingSize')
-        status = self.parse_order_status(self.safe_integer(order, 'status'))
-        average = self.safe_number(order, 'avgFillPrice')
-        cost = None
-        if filled is not None and average is not None:
-            cost = filled * average
+        if remaining is None and amount is not None and filled is not None:
+            remaining = amount - filled
+        status_raw = self.safe_string(order, 'status')
+        status = self.parse_order_status(
+            int(status_raw) if status_raw is not None else self.safe_string(order, 'orderState'))
+        average = self.safe_number_2(order, 'avgFillPrice', 'averageFillPrice')
+        cost = self.safe_number(order, 'orderValue')
+        if cost is None:
+            if filled is not None and average is not None:
+                cost = filled * average
+            elif amount is not None and price is not None:
+                cost = amount * price
 
         return {
             'id': id,
@@ -516,8 +537,10 @@ class lmex(Exchange):
             'symbol': symbol,
             'type': type,
             'timeInForce': self.safe_string(order, 'time_in_force'),
+            'postOnly': self.safe_value(order, 'postOnly'),
             'side': side,
             'price': price,
+            'stopPrice': self.safe_number(order, 'triggerPrice'),
             'average': average,
             'amount': amount,
             'filled': filled,
@@ -526,6 +549,9 @@ class lmex(Exchange):
             'trades': None,  # LMEX doesn't provide this in the order response
             'fee': None,  # LMEX doesn't provide this in the order response
             'info': order,
+            'reduceOnly': self.safe_value(order, 'reduceOnly'),
+            'triggerPrice': self.safe_number(order, 'triggerPrice'),
+            'contract': self.safe_number(order, 'contractSize'),
         }
 
     def parse_order_status(self, status):
@@ -541,7 +567,11 @@ class lmex(Exchange):
             15: 'rejected',
             16: 'rejected',  # not found
             17: 'rejected',  # request failed
+            'STATUS_ACTIVE': 'open',
+            'STATUS_INACTIVE': 'canceled',
         }
+        if isinstance(status, str) and status.isdigit():
+            status = int(status)
         return self.safe_string(statuses, status, 'unknown')
 
     def sign(self, path, api='public', method='GET', params={}, headers=None, body=None):
@@ -685,18 +715,29 @@ class lmex(Exchange):
 
     def fetch_leverage_tiers(self, symbols=None, params={}):
         self.load_markets()
-        response = self.publicGetApiV21RiskLimit(params)
-        return self.parse_leverage_tiers(response, symbols, 'symbol')
-
-    def parse_leverage_tiers(self, response, symbols=None, symbolKey=None):
         result = {}
-        for i in range(0, len(response)):
-            item = response[i]
-            id = self.safe_string(item, 'symbol')
-            market = self.safe_market(id)
-            symbol = market['symbol']
-            result[symbol] = self.parse_market_leverage_tiers(item, market)
-        return self.filter_by_array(result, 'symbol', symbols)
+        for symbol in symbols:
+            market = self.market(symbol)
+            request = {
+                'symbol': market['id'],
+            }
+            response = self.privateGetApiV21Leverage(self.extend(request, params))
+            result[symbol] = self.parse_leverage_tiers(response, market)
+        return result
+
+    def parse_leverage_tiers(self, response, market=None):
+        leverage = self.safe_number(response, 'leverage')
+        return [
+            {
+                'tier': 1,
+                'currency': market['quote'],
+                'minNotional': 0,
+                'maxNotional': float('inf'),  # Assuming no upper limit
+                'maintenanceMarginRate': None,  # LMEX doesn't provide this information
+                'maxLeverage': leverage,
+                'info': response,
+            }
+        ]
 
     def parse_market_leverage_tiers(self, info, market=None):
         tiers = []
@@ -730,6 +771,206 @@ class lmex(Exchange):
                 rates.append(self.extend(parsed, {'symbol': symbol}))
         sorted_rates = self.sort_by(rates, 'timestamp')
         return self.filter_by_symbol_since_limit(sorted_rates, market['symbol'] if market else None, since, limit)
+
+    def set_position_mode(self, hedged: bool, symbol=None, params={}):
+        """
+        set hedged to True or False for a market
+        :see: https://docs.lmex.io/pages/futures.html#/operations/post-api-v2.1-position_mode
+        :param bool hedged: set to True to use HEDGE_MODE, False for ONE_WAY
+        :param str symbol: not used by woo setPositionMode
+        :param dict [params]: extra parameters specific to the exchange API endpoint
+        :returns dict: response from the exchange
+        """
+        hedgeMode = 'HEDGE' if hedged else 'ONE_WAY'
+        request: dict = {
+            'positionMode': hedgeMode,
+            'symbol': symbol,
+        }
+        response = self.privatePostApiV21PositionMode(self.extend(request, params))
+        # {
+        #   "symbol": "string",
+        #   "timestamp": 0,
+        #   "status": "string",
+        #   "type": "string",
+        #   "message": "string"
+        # }
+        if 'success' in response and not response['success']:
+            raise ExchangeError(self.id + ' setPositionMode() failed: ' + self.json(response))
+        return response
+
+    def set_margin_mode(self, marginMode, symbol=None, params={}):
+        """
+        set margin mode to 'cross' or 'isolated'
+        :param str marginMode: 'cross' or 'isolated'
+        :param str symbol: unified market symbol
+        :param dict params: extra parameters specific to the lmex api endpoint
+        :returns dict: response from the exchange
+        """
+        if symbol is None:
+            raise ArgumentsRequired(self.id + ' setMarginMode() requires a symbol argument')
+
+        self.load_markets()
+        market = self.market(symbol)
+
+        marginMode = marginMode.upper()
+        if marginMode != 'CROSS' and marginMode != 'ISOLATED':
+            raise BadRequest(self.id + ' setMarginMode() marginMode must be either "cross" or "isolated"')
+
+        request = {
+            'symbol': market['id'],
+            'leverage': 0 if marginMode == 'CROSS' else None,  # 0 means maximum leverage for cross mode
+            'marginMode': marginMode,
+        }
+
+        # LMEX uses the leverage endpoint to set margin mode
+        response = self.privatePostApiV21Leverage(self.extend(request, params))
+
+        return {
+            'info': response,
+            'type': marginMode.lower()
+        }
+
+    def fetch_open_interest(self, symbol, params={}):
+        """
+        Fetch the open interest of a market
+        :param str symbol: unified market symbol
+        :param dict params: extra parameters specific to the lmex api endpoint
+        :returns dict: an open interest structure
+        """
+        self.load_markets()
+        market = self.market(symbol)
+        request = {
+            'symbol': market['id'],
+        }
+        response = self.publicGetApiV21MarketSummary(self.extend(request, params))
+
+        # Find the market summary for the requested symbol
+        marketSummary = None
+        for summary in response:
+            if summary['symbol'] == market['id']:
+                marketSummary = summary
+                break
+
+        if marketSummary is None:
+            raise ExchangeError(self.id + ' fetchOpenInterest() could not find market summary for symbol ' + symbol)
+
+        return self.parse_open_interest(marketSummary, market)
+
+    def parse_open_interest(self, interest, market=None):
+        """
+        Parse the open interest returned by the exchange
+        :param dict interest: open interest structure as returned by the exchange
+        :param dict market: CCXT market
+        """
+        timestamp = self.milliseconds()
+        symbol = self.safe_symbol(None, market)
+        openInterestAmount = self.safe_number(interest, 'openInterest')
+        openInterestValue = self.safe_number(interest, 'openInterestUSD')
+        return {
+            'symbol': symbol,
+            'openInterestAmount': openInterestAmount,
+            'openInterestValue': openInterestValue,
+            'baseVolume': openInterestAmount,  # deprecated, use openInterestAmount instead
+            'quoteVolume': openInterestValue,  # deprecated, use openInterestValue instead
+            'timestamp': timestamp,
+            'datetime': self.iso8601(timestamp),
+            'info': interest,
+        }
+
+    def fetch_positions_risk(self, symbols=None, params={}):
+        """
+        Fetch positions with risk data
+        :param [str]|None symbols: list of unified market symbols
+        :param dict params: extra parameters specific to the lmex api endpoint
+        :returns [dict]: a list of position risk structures
+        """
+        self.load_markets()
+        response = self.privateGetApiV21UserPositions(params)
+
+        result = []
+        for position in response:
+            if symbols is None or self.safe_string(position, 'symbol') in symbols:
+                result.append(self.parse_position_risk(position))
+
+        return result
+
+    def parse_position_risk(self, position, market=None):
+        """
+        Parse the position risk returned by the exchange
+        :param dict position: position structure as returned by the exchange
+        :param dict market: CCXT market
+        """
+        market_id = self.safe_string(position, 'symbol')
+        market = self.safe_market(market_id, market)
+        symbol = market['symbol']
+        side = self.safe_string_lower(position, 'side')
+        amount = self.safe_number(position, 'size')
+        if side == 'sell':
+            amount = -amount
+
+        timestamp = self.safe_integer(position, 'timestamp')
+
+        return {
+            'info': position,
+            'symbol': symbol,
+            'timestamp': timestamp,
+            'datetime': self.iso8601(timestamp),
+            'initialMargin': self.safe_number(position, 'orderValue'),
+            'initialMarginPercentage': None,
+            'maintenanceMargin': self.safe_number(position, 'totalMaintenanceMargin'),
+            'maintenanceMarginPercentage': None,
+            'entryPrice': self.safe_number(position, 'entryPrice'),
+            'notional': self.safe_number(position, 'orderValue'),
+            'leverage': self.safe_number(position, 'isolatedLeverage'),
+            'unrealizedPnl': self.safe_number(position, 'unrealizedProfitLoss'),
+            'contracts': abs(amount),
+            'contractSize': self.safe_number(market, 'contractSize'),
+            'marginRatio': None,
+            'liquidationPrice': self.safe_number(position, 'liquidationPrice'),
+            'markPrice': self.safe_number(position, 'markPrice'),
+            'collateral': self.safe_number(position, 'orderValue'),
+            'marginMode': 'isolated' if self.safe_number(position, 'isolatedLeverage') else 'cross',
+            'side': 'long' if amount > 0 else 'short',
+            'percentage': None,
+            'hedged': self.safe_string(position, 'positionMode') == 'HEDGE',
+            'delta': None,
+            # Additional risk-related fields
+            'liquidationPriceDistance': None,  # Not provided by LMEX
+            'liquidationFundingRateDiff': None,  # Not provided by LMEX
+            'adlRankIndicator': self.safe_integer(position, 'adlScoreBucket'),
+            'currentLeverage': self.safe_number(position, 'currentLeverage'),
+        }
+
+    def close_position(self, symbol, side=None, params={}):
+        """
+        Close an open position
+        :param str symbol: unified market symbol
+        :param str|None side: 'buy' or 'sell' for closing a short or long position respectively. If not provided, the method will attempt to close both long and short positions.
+        :param dict params: extra parameters specific to the lmex api endpoint
+        :returns dict: an order structure
+        """
+        self.load_markets()
+        market = self.market(symbol)
+        request = {
+            'symbol': market['id'],
+            'type': 'MARKET',  # LMEX uses 'MARKET' for market orders
+        }
+
+        # LMEX requires positionId for hedge mode
+        position_mode = self.safe_string(params, 'positionMode')
+        if position_mode == 'HEDGE':
+            if side is None:
+                raise ArgumentsRequired(self.id + ' closePosition() requires a side parameter for hedge mode')
+            position_id = self.safe_string(params, 'positionId')
+            if position_id is None:
+                raise ArgumentsRequired(self.id + ' closePosition() requires a positionId parameter for hedge mode')
+            request['positionId'] = position_id
+        elif side is not None:
+            request['side'] = 'SELL' if side.upper() == 'BUY' else 'BUY'  # Reverse the side to close the position
+
+        response = self.privatePostApiV21OrderClosePosition(self.extend(request, params))
+
+        return self.parse_order(response)
 
     def publicGetApiV21Ohlcv(self, params={}):
         return self.request('api/v2.1/ohlcv', 'public', 'GET', params)
@@ -777,7 +1018,20 @@ class lmex(Exchange):
     def privatePostApiV21Leverage(self, params={}):
         return self.request('api/v2.1/leverage', 'private', 'POST', params)
 
+    def privateGetApiV21Leverage(self, params={}):
+        return self.request('api/v2.1/leverage', 'private', 'GET', params)
+
     def privateDeleteApiV21Order(self, params={}):
         path = 'api/v2.1/order'
         return self.request(path, 'private', 'DELETE', params, {}, None)  # Explicitly pass empty headers and body
+
+    def privatePostApiV21PositionMode(self, params={}):
+        return self.request('api/v2.1/position_mode', 'private', 'POST', params)
+
+    def privatePostApiV21OrderClosePosition(self, params={}):
+        return self.request('api/v2.1/order/close_position', 'private', 'POST', params)
+
+    def privateGetApiV21RiskLimit(self, params={}):
+        return self.request('api/v2.1/risk_limit', 'private', 'GET', params)
+
 
